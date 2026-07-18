@@ -1,0 +1,143 @@
+// ============================================================================
+// Phantom Fleet — Zero-Knowledge Battleship
+// Reference implementation in Compact (Midnight's smart-contract language).
+//
+// STATUS: reference source only. This contract was NOT compiled or deployed
+// during the hackathon — the Compact toolchain (compactc) and a local proof
+// server require Docker / the Midnight SDK, which were unavailable in the
+// build environment. Deployment steps: see README.md ("Deploying on Midnight").
+//
+// The design mirrors the in-browser circom/snarkjs demo 1:1
+// (circuits/hitmiss.circom):
+//   commitment = Poseidon(packed, salt)   with packed = Σ board[i]·2^i
+//   a shot answer proves only board[x*10+y] ∈ {0,1} against the commitment —
+//   the fleet itself never leaves the owner's machine.
+//
+// NOTE: exact CompactStandardLibrary helper names (hash, casts) may need minor
+// adjustment to the installed toolchain version at integration time.
+// ============================================================================
+
+pragma language_version >= 0.14;
+
+import CompactStandardLibrary;
+
+// ---------------------------------------------------------------------------
+// Public ledger state
+// ---------------------------------------------------------------------------
+
+export ledger phase: Uint<8>;          // 0 = lobby, 1 = battle, 2 = finished
+export ledger commitmentA: Bytes<32>;  // fleet commitment of player A (creator)
+export ledger commitmentB: Bytes<32>;  // fleet commitment of player B (joiner)
+export ledger hitsByA: Uint<8>;        // hits scored by A on B's fleet (17 wins)
+export ledger hitsByB: Uint<8>;        // hits scored by B on A's fleet
+export ledger aToFire: Boolean;        // true = A fires next, false = B fires next
+export ledger pendingX: Uint<8>;       // coordinate of the shot awaiting an answer
+export ledger pendingY: Uint<8>;
+export ledger pendingOpen: Boolean;    // a shot has been fired but not answered
+export ledger winner: Uint<8>;         // 0 = none, 1 = A, 2 = B
+
+// ---------------------------------------------------------------------------
+// Witnesses — private data, never touches the chain
+// ---------------------------------------------------------------------------
+
+// The prover's private 10x10 fleet: 100 cells, 1 = ship, 0 = water.
+witness fleetBoard(): Vector<100, Uint<1>>;
+// The prover's private commitment salt.
+witness fleetSalt(): Field;
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+// Recompute Poseidon(packed, salt) from the private board and bind it to the
+// public commitment. Also enforces that every cell is a bit.
+circuit checkFleet(commitment: Bytes<32>): [] {
+  const board = fleetBoard();
+  const salt  = fleetSalt();
+  let packed  = 0 as Field;
+  for (const i of 0..100) {
+    assert(board[i] == 0 || board[i] == 1, "board cells must be bits");
+    packed = packed + (board[i] as Field) * (2 ** i);
+  }
+  assert(poseidonHash(packed, salt) == commitment, "fleet does not match its commitment");
+}
+
+// Prove (privately) that the cell (x, y) of the prover's committed fleet holds
+// exactly `result` — without revealing any other cell.
+circuit checkShot(x: Uint<8>, y: Uint<8>, result: Uint<8>): [] {
+  assert(x < 10, "x out of range");
+  assert(y < 10, "y out of range");
+  assert(result == 0 || result == 1, "result must be a bit");
+  const board = fleetBoard();
+  assert(board[(x * 10 + y) as Uint<64>] == result, "answer does not match the committed fleet");
+}
+
+// ---------------------------------------------------------------------------
+// Exported circuits — the game protocol
+// ---------------------------------------------------------------------------
+
+// Player A creates the game and commits to their fleet.
+export circuit newGame(commitment: Bytes<32>): [] {
+  assert(phase == 0, "game already created");
+  checkFleet(commitment);                       // A proves the commitment is well-formed
+  commitmentA = disclose(commitment);
+  phase         = disclose(1 as Uint<8>);       // battle starts once B joins; see joinGame
+  aToFire       = disclose(true);               // A fires first
+  hitsByA       = disclose(0 as Uint<8>);
+  hitsByB       = disclose(0 as Uint<8>);
+  pendingOpen   = disclose(false);
+  winner        = disclose(0 as Uint<8>);
+  // Lobby semantics: A may create before B arrives; phase 0 -> waiting is an
+  // integration-time choice. Here newGame parks in lobby until joinGame.
+  phase         = disclose(0 as Uint<8>);
+}
+
+// Player B joins with their own fleet commitment; battle begins.
+export circuit joinGame(commitment: Bytes<32>): [] {
+  assert(phase == 0, "no open lobby");
+  assert(commitmentA != 0 as Bytes<32>, "game not initialized");
+  checkFleet(commitment);
+  commitmentB = disclose(commitment);
+  phase       = disclose(1 as Uint<8>);         // battle
+}
+
+// The player whose turn it is fires at (x, y). The opponent must answer with
+// respondShot before anything else can happen.
+export circuit fireShot(x: Uint<8>, y: Uint<8>): [] {
+  assert(phase == 1, "not in battle");
+  assert(!pendingOpen, "previous shot is still unanswered");
+  assert(x < 10, "x out of range");
+  assert(y < 10, "y out of range");
+  pendingX    = disclose(x);
+  pendingY    = disclose(y);
+  pendingOpen = disclose(true);
+}
+
+// The defender answers the pending shot. The witness (private board + salt)
+// constrains the answer to the committed fleet: a lie fails proof generation.
+export circuit respondShot(x: Uint<8>, y: Uint<8>, result: Uint<8>): [] {
+  assert(phase == 1, "not in battle");
+  assert(pendingOpen, "no shot to answer");
+  assert(x == pendingX && y == pendingY, "answering the wrong shot");
+  // Bind answer to the DEFENDER's commitment (B answers A's shots and vice versa).
+  if (aToFire) {
+    checkFleet(commitmentB);
+  } else {
+    checkFleet(commitmentA);
+  }
+  checkShot(x, y, result);
+  if (result == 1) {
+    if (aToFire) { hitsByA = disclose(hitsByA + 1); }
+    else         { hitsByB = disclose(hitsByB + 1); }
+  }
+  pendingOpen = disclose(false);
+  aToFire     = disclose(!aToFire);             // turn passes to the other player
+}
+
+// Either player may claim victory once 17 cells of the enemy fleet are hit.
+export circuit claimWin(): [] {
+  assert(phase == 1, "not in battle");
+  assert(hitsByA >= 17 || hitsByB >= 17, "no fleet is fully sunk yet");
+  winner = disclose(hitsByA >= 17 ? (1 as Uint<8>) : (2 as Uint<8>));
+  phase  = disclose(2 as Uint<8>);              // finished
+}
