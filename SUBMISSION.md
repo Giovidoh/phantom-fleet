@@ -49,11 +49,11 @@ witness generation. You *cannot* answer dishonestly.
 - **Frontend:** React 19 + Vite 8 + TypeScript + Tailwind CSS 4. Proving runs
   in a Web Worker (`snarkjs.groth16.fullProve`) so the UI stays responsive;
   verification happens on the main thread.
-- **Midnight layer:** the identical protocol written as a Compact reference
-  contract (`newGame`, `joinGame`, `fireShot`, `respondShot`, `claimWin`),
-  with the private board and salt as witnesses — ready for deployment, with
-  the JS commitment code already computing exactly the witness values the
-  contract expects.
+- **Midnight layer:** the same protocol written as a real Compact contract
+  (`constructor` seals player 1's fleet, `joinGame`, `fireShot`,
+  `respondShot`), with the fleet and salt kept as private witnesses —
+  plus headless preprod deploy/call scripts (`scripts/midnight/`) and a
+  Codespaces compile runbook (`COMPILE.md`).
 - **Verification culture:** a headless test suite proves a hit, proves a miss,
   and — the important part — confirms that a false claim and a wrong
   commitment are both *rejected*.
