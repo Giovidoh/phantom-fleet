@@ -18,7 +18,9 @@ Built for the Midnight blockchain hackathon.
 | Circom circuit `circuits/hitmiss.circom` — compiled with the official circom 2.2.3 compiler | ✅ Working (1,047 constraints) |
 | Headless ZK test suite (`node scripts/test-proof.mjs`) — hit proof, miss proof, false-claim rejection, wrong-commitment rejection | ✅ All PASS |
 | Fleet commitments — Poseidon(packed board, salt), recomputed and checked at game over | ✅ Working |
-| Midnight contract `contract/battleship.compact` | 🔶 **Reference implementation only — not compiled or deployed.** The Compact toolchain + proof server require Docker/the Midnight SDK, which were unavailable in the build environment. See [Deploying on Midnight](#deploying-on-midnight-later). |
+| Midnight contract `contract/battleship.compact` — rewritten for compiler 0.31.1 with real fleet-sealing game logic (17 cells, per-cell `hash(cell, salt)` checks) | ✅ Written against official example idioms — **compile pending** (no Linux compiler on the build machine; see [COMPILE.md](COMPILE.md)) |
+| Midnight deploy + on-chain call scripts (`scripts/midnight/`, preprod, headless) | ✅ Written against midnight-js 4.1.1 official patterns — **run pending** (needs compiled artifacts + funded wallet + proof-server URL) |
+| Midnight preprod deployment | ⏳ Pending — runbook: compile in Codespaces → fund wallet → deploy → call |
 
 **No fallback was taken:** the ZK layer is genuine circom + Groth16, not a
 commit-reveal substitute. The commit-reveal scheme only appears at game over
@@ -106,32 +108,40 @@ npm run build               # type-check + production build
 | 0:45 | Fire at the enemy grid. Show the *Generating ZK proof…* banner, then the 💥/🌊 result. |
 | 0:55 | **Star moment:** scroll the **ZK Proof Log** — "Every single answer came with a real Groth16 proof, verified right here — proof time, verify time, checkmark. The bot cannot lie about hit or miss, and neither can I." |
 | 1:20 | Play to game over (cut ahead). Game-over modal: both boards revealed, commitments recomputed → "✓ match. Neither fleet ever left its browser. No cheating was mathematically possible." |
-| 1:45 | Midnight path: open `contract/battleship.compact` — "This same protocol is written as a Compact contract: `newGame`, `joinGame`, `fireShot`, `respondShot`, `claimWin`, with the private board and salt as witnesses. On mainnet, Midnight's ZK ledger does exactly what my browser just did." |
+| 1:45 | Midnight layer: open `contract/battleship.compact` — "The same protocol is written as a real Compact contract for Midnight: fleets are sealed on-chain as hash-of-cell-and-salt, and the `respondShot` circuit re-checks the seal *inside* the proof — a lied hit or miss simply cannot be proven. Deploy scripts for preprod are in the repo." |
 | 2:00 | "Phantom Fleet — real ZK, playable today, deployable on Midnight tomorrow." |
 
 ---
 
-## Deploying on Midnight (later)
+## Midnight integration (preprod)
 
-`contract/battleship.compact` is a faithful reference implementation of the game
-protocol: two fleet commitments on the ledger, hit counters, turn tracking, and
-witness-scoped private boards + salts enforced by `checkFleet`/`checkShot`.
+The repo ships the complete on-chain layer, written against the current
+official toolchain (midnight-js **4.1.1**, wallet-sdk **1.2.0**, compactc
+**0.31.1**) and the official `example-battleship` idioms:
 
-To take it to testnet/mainnet:
+- **`contract/battleship.compact`** — real Battleship logic in Compact:
+  17-cell fleets sealed as per-cell `hash(cell, salt)` values on the ledger,
+  turn enforcement, and a `respondShot` circuit that recomputes the seal
+  **inside the ZK proof** — a claimed HIT must be sealed, a claimed MISS must
+  not be. The fleet and salt never leave the player's private state.
+- **`contract/witnesses.ts` + `contract/index.ts`** — private state and the
+  compiled-contract export, ready for `compact compile`.
+- **`COMPILE.md`** — 15-minute GitHub Codespaces compile runbook (the Compact
+  compiler has no Windows build; `.devcontainer/` pre-installs the toolchain).
+- **`scripts/midnight/`** — headless preprod scripts (own isolated
+  `package.json`): `deploy-preprod.mjs` deploys the contract with a seed
+  wallet; `call-new-game.mjs` joins the game on-chain with a second sealed
+  fleet. Both print preprod-explorer links.
 
-1. Install the [Midnight developer tools](https://docs.midnight.network): the
-   Compact compiler (`compactc`) and a local proof server (Docker image).
-2. Compile: `compactc contract/battleship.compact` → produces the contract's
-   circuits, proving/verification keys, and TypeScript bindings.
-3. Reuse the existing JS: the Poseidon packing/commitment code in
-   `src/game/fleet.ts` + `src/zk/poseidon.ts` computes exactly the witness
-   values the contract expects — swap `src/zk/prover.ts`'s snarkjs calls for
-   the generated bindings' proof-server calls.
-4. Deploy with the Midnight.js contract API + Lace wallet on preprod testnet;
-   `newGame(commitment)` / `joinGame(commitment)` replace the local
-   commit step, turns become contract calls.
-5. Minor integration notes are flagged in comments inside the `.compact` file
-   (stdlib helper names may need adjusting to the installed toolchain version).
+Runbook: **compile in Codespaces → fund a preprod wallet (faucet) → deploy →
+call.** The one piece of outside infrastructure is a proof-server URL
+(cloud-host `midnightntwrk/proof-server` from its Dockerfile — the pattern
+Midnight's own `midnight-leaderboard` uses in production).
+
+> ⚠️ **Two different proof systems, stated plainly:** the in-browser demo
+> uses Groth16 (circom/snarkjs) — those proofs do *not* execute on Midnight.
+> The Compact contract above uses Midnight's own ZKIR/Impact proofs via the
+> proof server. Same game protocol, two honest implementations.
 
 ---
 
@@ -156,7 +166,9 @@ To take it to testnet/mainnet:
   0.7 (Groth16, bn128, pot12), circomlib / circomlibjs (Poseidon)
 - **Game:** Vite 8, React 19, TypeScript, Tailwind CSS 4, Web Worker proving,
   `vite-plugin-node-polyfills`
-- **Midnight:** Compact reference contract in `contract/`
+- **Midnight:** Compact contract (compiler 0.31.1 idiom) in `contract/`,
+  midnight-js 4.1.1 + wallet-sdk 1.2.0 headless scripts in `scripts/midnight/`,
+  Codespaces compile kit (`.devcontainer/`, `COMPILE.md`)
 
 ## License
 

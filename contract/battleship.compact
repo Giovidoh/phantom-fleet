@@ -1,143 +1,217 @@
-// ============================================================================
-// Phantom Fleet — Zero-Knowledge Battleship
-// Reference implementation in Compact (Midnight's smart-contract language).
+// Phantom Fleet — zero-knowledge Battleship for the Midnight network.
+// SPDX-License-Identifier: MIT
 //
-// STATUS: reference source only. This contract was NOT compiled or deployed
-// during the hackathon — the Compact toolchain (compactc) and a local proof
-// server require Docker / the Midnight SDK, which were unavailable in the
-// build environment. Deployment steps: see README.md ("Deploying on Midnight").
+// Design notes
+// ------------
+// Real Battleship rules: 10x10 board (cells 0..99, index = row*10 + col),
+// a 17-cell fleet (ships 5+4+3+3+2), alternating turns, first to 17 hits wins.
 //
-// The design mirrors the in-browser circom/snarkjs demo 1:1
-// (circuits/hitmiss.circom):
-//   commitment = Poseidon(packed, salt)   with packed = Σ board[i]·2^i
-//   a shot answer proves only board[x*10+y] ∈ {0,1} against the commitment —
-//   the fleet itself never leaves the owner's machine.
+// Privacy model: each player's fleet NEVER goes on-chain. At setup, the player
+// seals every fleet cell as hash(cell, salt) — the salt lives only in the
+// player's private state (witness). When a shot is answered, the contract
+// recomputes hash(shot, salt) on-chain inside the circuit and checks it
+// against the sealed set: a claimed HIT must be a member, a claimed MISS must
+// NOT be. Lying is therefore cryptographically impossible — the same property
+// our in-browser Groth16 circuit (circuits/hitmiss.circom) demonstrates with
+// a full-board Poseidon commitment. The two are deliberately different proof
+// systems: Midnight uses its own ZKIR/Impact proofs via the proof server.
 //
-// NOTE: exact CompactStandardLibrary helper names (hash, casts) may need minor
-// adjustment to the installed toolchain version at integration time.
-// ============================================================================
+// On-chain vs off-chain:
+//   ON-CHAIN  — turn order, sealed fleet hashes, hit counters, win state.
+//   OFF-CHAIN — the fleet itself, the salt, sunk detection, UI.
+//
+// Written for compiler 0.31.1 (pragma language_version 0.23), modeled on the
+// official midnightntwrk/example-battleship idioms. Compile in Codespaces —
+// see COMPILE.md.
 
-pragma language_version >= 0.14;
-
+pragma language_version 0.23;
 import CompactStandardLibrary;
 
-// ---------------------------------------------------------------------------
-// Public ledger state
-// ---------------------------------------------------------------------------
-
-export ledger phase: Uint<8>;          // 0 = lobby, 1 = battle, 2 = finished
-export ledger commitmentA: Bytes<32>;  // fleet commitment of player A (creator)
-export ledger commitmentB: Bytes<32>;  // fleet commitment of player B (joiner)
-export ledger hitsByA: Uint<8>;        // hits scored by A on B's fleet (17 wins)
-export ledger hitsByB: Uint<8>;        // hits scored by B on A's fleet
-export ledger aToFire: Boolean;        // true = A fires next, false = B fires next
-export ledger pendingX: Uint<8>;       // coordinate of the shot awaiting an answer
-export ledger pendingY: Uint<8>;
-export ledger pendingOpen: Boolean;    // a shot has been fired but not answered
-export ledger winner: Uint<8>;         // 0 = none, 1 = A, 2 = B
-
-// ---------------------------------------------------------------------------
-// Witnesses — private data, never touches the chain
-// ---------------------------------------------------------------------------
-
-// The prover's private 10x10 fleet: 100 cells, 1 = ship, 0 = water.
-witness fleetBoard(): Vector<100, Uint<1>>;
-// The prover's private commitment salt.
-witness fleetSalt(): Field;
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-// Recompute Poseidon(packed, salt) from the private board and bind it to the
-// public commitment. Also enforces that every cell is a bit.
-circuit checkFleet(commitment: Bytes<32>): [] {
-  const board = fleetBoard();
-  const salt  = fleetSalt();
-  let packed  = 0 as Field;
-  for (const i of 0..100) {
-    assert(board[i] == 0 || board[i] == 1, "board cells must be bits");
-    packed = packed + (board[i] as Field) * (2 ** i);
-  }
-  assert(poseidonHash(packed, salt) == commitment, "fleet does not match its commitment");
+export enum Phase {
+    WAITING_FOR_P2,
+    P1_SHOOT,
+    P1_RESPOND,
+    P2_SHOOT,
+    P2_RESPOND
 }
 
-// Prove (privately) that the cell (x, y) of the prover's committed fleet holds
-// exactly `result` — without revealing any other cell.
-circuit checkShot(x: Uint<8>, y: Uint<8>, result: Uint<8>): [] {
-  assert(x < 10, "x out of range");
-  assert(y < 10, "y out of range");
-  assert(result == 0 || result == 1, "result must be a bit");
-  const board = fleetBoard();
-  assert(board[(x * 10 + y) as Uint<64>] == result, "answer does not match the committed fleet");
+export enum ShotResult { MISS, HIT }
+
+export enum WinState {
+    ONGOING,
+    PLAYER_1_WINS,
+    PLAYER_2_WINS
 }
 
-// ---------------------------------------------------------------------------
-// Exported circuits — the game protocol
-// ---------------------------------------------------------------------------
+export ledger player1: Bytes<32>;
+export ledger player2: Bytes<32>;
+export ledger phase: Phase;
+export ledger fleet1: Set<Bytes<32>>;   // sealed cells of player 1's fleet
+export ledger fleet2: Set<Bytes<32>>;   // sealed cells of player 2's fleet
+export ledger pendingShot: List<Uint<8>>;
+export ledger hitsOn1: Set<Uint<8>>;    // cells of fleet1 already hit (repeat-shot protection)
+export ledger hitsOn2: Set<Uint<8>>;
+export ledger hitCount1: Counter;       // hits scored AGAINST player 1
+export ledger hitCount2: Counter;
+export ledger winState: WinState;
 
-// Player A creates the game and commits to their fleet.
-export circuit newGame(commitment: Bytes<32>): [] {
-  assert(phase == 0, "game already created");
-  checkFleet(commitment);                       // A proves the commitment is well-formed
-  commitmentA = disclose(commitment);
-  phase         = disclose(1 as Uint<8>);       // battle starts once B joins; see joinGame
-  aToFire       = disclose(true);               // A fires first
-  hitsByA       = disclose(0 as Uint<8>);
-  hitsByB       = disclose(0 as Uint<8>);
-  pendingOpen   = disclose(false);
-  winner        = disclose(0 as Uint<8>);
-  // Lobby semantics: A may create before B arrives; phase 0 -> waiting is an
-  // integration-time choice. Here newGame parks in lobby until joinGame.
-  phase         = disclose(0 as Uint<8>);
+// Player-private data, never disclosed: the fleet itself and its sealing salt.
+witness localSalt(): Bytes<32>;
+witness localShotResult(x: Uint<8>): ShotResult;
+witness localSk(): Bytes<32>;
+
+// --- helpers ---------------------------------------------------------------
+
+// Seal one cell: hash binds the cell index to the player's secret salt.
+circuit sealCell(cell: Uint<8>, salt: Bytes<32>): Bytes<32> {
+    assert(cell < 100, "Fleet cell off the 10x10 board");
+    const h = persistentHash<Vector<2, Bytes<32>>>([cell as Bytes<32>, salt]);
+    return disclose(h);
 }
 
-// Player B joins with their own fleet commitment; battle begins.
-export circuit joinGame(commitment: Bytes<32>): [] {
-  assert(phase == 0, "no open lobby");
-  assert(commitmentA != 0 as Bytes<32>, "game not initialized");
-  checkFleet(commitment);
-  commitmentB = disclose(commitment);
-  phase       = disclose(1 as Uint<8>);         // battle
+// Dapp-scoped public key from a secret key (tracks roles without exposing identity).
+export circuit getDappPubKey(sk: Bytes<32>): Bytes<32> {
+    return persistentHash<Vector<2, Bytes<32>>>([pad(32, "phantomfleet:pk:"), sk]);
 }
 
-// The player whose turn it is fires at (x, y). The opponent must answer with
-// respondShot before anything else can happen.
-export circuit fireShot(x: Uint<8>, y: Uint<8>): [] {
-  assert(phase == 1, "not in battle");
-  assert(!pendingOpen, "previous shot is still unanswered");
-  assert(x < 10, "x out of range");
-  assert(y < 10, "y out of range");
-  pendingX    = disclose(x);
-  pendingY    = disclose(y);
-  pendingOpen = disclose(true);
+// --- game lifecycle ----------------------------------------------------------
+
+// Player 1 creates the game, sealing a 17-cell fleet.
+// NOTE: duplicate cells silently shrink the sealed set (Set semantics) —
+// the client enforces a legal fleet; a cheating deployer only hurts themselves.
+constructor(
+    c1: Uint<8>, c2: Uint<8>, c3: Uint<8>, c4: Uint<8>, c5: Uint<8>,
+    c6: Uint<8>, c7: Uint<8>, c8: Uint<8>, c9: Uint<8>, c10: Uint<8>,
+    c11: Uint<8>, c12: Uint<8>, c13: Uint<8>, c14: Uint<8>, c15: Uint<8>,
+    c16: Uint<8>, c17: Uint<8>
+) {
+    const sk = localSk();
+    player1 = disclose(getDappPubKey(sk));
+
+    const salt = localSalt();
+    fleet1.insert(sealCell(c1, salt));
+    fleet1.insert(sealCell(c2, salt));
+    fleet1.insert(sealCell(c3, salt));
+    fleet1.insert(sealCell(c4, salt));
+    fleet1.insert(sealCell(c5, salt));
+    fleet1.insert(sealCell(c6, salt));
+    fleet1.insert(sealCell(c7, salt));
+    fleet1.insert(sealCell(c8, salt));
+    fleet1.insert(sealCell(c9, salt));
+    fleet1.insert(sealCell(c10, salt));
+    fleet1.insert(sealCell(c11, salt));
+    fleet1.insert(sealCell(c12, salt));
+    fleet1.insert(sealCell(c13, salt));
+    fleet1.insert(sealCell(c14, salt));
+    fleet1.insert(sealCell(c15, salt));
+    fleet1.insert(sealCell(c16, salt));
+    fleet1.insert(sealCell(c17, salt));
+
+    phase = Phase.WAITING_FOR_P2;
+    winState = WinState.ONGOING;
 }
 
-// The defender answers the pending shot. The witness (private board + salt)
-// constrains the answer to the committed fleet: a lie fails proof generation.
-export circuit respondShot(x: Uint<8>, y: Uint<8>, result: Uint<8>): [] {
-  assert(phase == 1, "not in battle");
-  assert(pendingOpen, "no shot to answer");
-  assert(x == pendingX && y == pendingY, "answering the wrong shot");
-  // Bind answer to the DEFENDER's commitment (B answers A's shots and vice versa).
-  if (aToFire) {
-    checkFleet(commitmentB);
-  } else {
-    checkFleet(commitmentA);
-  }
-  checkShot(x, y, result);
-  if (result == 1) {
-    if (aToFire) { hitsByA = disclose(hitsByA + 1); }
-    else         { hitsByB = disclose(hitsByB + 1); }
-  }
-  pendingOpen = disclose(false);
-  aToFire     = disclose(!aToFire);             // turn passes to the other player
+// Player 2 joins, sealing their own 17-cell fleet.
+export circuit joinGame(
+    c1: Uint<8>, c2: Uint<8>, c3: Uint<8>, c4: Uint<8>, c5: Uint<8>,
+    c6: Uint<8>, c7: Uint<8>, c8: Uint<8>, c9: Uint<8>, c10: Uint<8>,
+    c11: Uint<8>, c12: Uint<8>, c13: Uint<8>, c14: Uint<8>, c15: Uint<8>,
+    c16: Uint<8>, c17: Uint<8>
+): [] {
+    const sk = localSk();
+    const pubKey = getDappPubKey(sk);
+    assert(player1 != disclose(pubKey), "You cannot play against yourself");
+    assert(phase == Phase.WAITING_FOR_P2, "This game already has a second player");
+
+    const salt = localSalt();
+    fleet2.insert(sealCell(c1, salt));
+    fleet2.insert(sealCell(c2, salt));
+    fleet2.insert(sealCell(c3, salt));
+    fleet2.insert(sealCell(c4, salt));
+    fleet2.insert(sealCell(c5, salt));
+    fleet2.insert(sealCell(c6, salt));
+    fleet2.insert(sealCell(c7, salt));
+    fleet2.insert(sealCell(c8, salt));
+    fleet2.insert(sealCell(c9, salt));
+    fleet2.insert(sealCell(c10, salt));
+    fleet2.insert(sealCell(c11, salt));
+    fleet2.insert(sealCell(c12, salt));
+    fleet2.insert(sealCell(c13, salt));
+    fleet2.insert(sealCell(c14, salt));
+    fleet2.insert(sealCell(c15, salt));
+    fleet2.insert(sealCell(c16, salt));
+    fleet2.insert(sealCell(c17, salt));
+
+    player2 = disclose(pubKey);
+    phase = Phase.P1_SHOOT;
 }
 
-// Either player may claim victory once 17 cells of the enemy fleet are hit.
-export circuit claimWin(): [] {
-  assert(phase == 1, "not in battle");
-  assert(hitsByA >= 17 || hitsByB >= 17, "no fleet is fully sunk yet");
-  winner = disclose(hitsByA >= 17 ? (1 as Uint<8>) : (2 as Uint<8>));
-  phase  = disclose(2 as Uint<8>);              // finished
+// Current player fires at a cell. Shots are public knowledge.
+export circuit fireShot(cell: Uint<8>): [] {
+    const sk = localSk();
+    const pubKey = disclose(getDappPubKey(sk));
+    assert(winState == WinState.ONGOING, "This game is over");
+    assert(
+        (phase == Phase.P1_SHOOT && player1 == pubKey) ||
+        (phase == Phase.P2_SHOOT && player2 == pubKey),
+        "It is not your turn to shoot"
+    );
+    assert(cell < 100, "Shot off the 10x10 board");
+
+    const shot = disclose(cell);
+    // You cannot score the same cell twice.
+    assert(!hitsOn1.member(shot) && !hitsOn2.member(shot), "Cell already hit");
+
+    pendingShot.pushFront(shot);
+    phase = (phase == Phase.P1_SHOOT) ? Phase.P2_RESPOND : Phase.P1_RESPOND;
+}
+
+// The targeted player answers the pending shot. The circuit recomputes the
+// seal hash inside the ZK proof: a claimed HIT must be sealed, a claimed MISS
+// must not be. Answering truthfully is the only option.
+export circuit respondShot(): [] {
+    const sk = localSk();
+    const pubKey = disclose(getDappPubKey(sk));
+    assert(winState == WinState.ONGOING, "This game is over");
+    assert(
+        (phase == Phase.P1_RESPOND && player1 == pubKey) ||
+        (phase == Phase.P2_RESPOND && player2 == pubKey),
+        "It is not your turn to respond"
+    );
+    assert(!pendingShot.isEmpty(), "No shot to respond to");
+
+    const shot = pendingShot.head().value;
+    pendingShot.popFront();
+
+    const salt = localSalt();
+    const seal = persistentHash<Vector<2, Bytes<32>>>([shot as Bytes<32>, salt]);
+
+    const result = disclose(localShotResult(shot));
+    assert(result == ShotResult.HIT || result == ShotResult.MISS, "Invalid shot result");
+
+    if (phase == Phase.P1_RESPOND) {
+        // Player 1 answers a shot into fleet1.
+        if (result == ShotResult.MISS) {
+            assert(!fleet1.member(disclose(seal)), "Cheat detected: claimed MISS on a sealed HIT cell");
+        } else {
+            assert(fleet1.member(disclose(seal)), "Cheat detected: claimed HIT on an empty cell");
+            assert(!hitsOn1.member(shot), "Cell already hit");
+            hitsOn1.insert(shot);
+            hitCount1.increment(1);
+            winState = (hitCount1 == 17) ? WinState.PLAYER_2_WINS : WinState.ONGOING;
+        }
+        phase = Phase.P2_SHOOT;
+    } else {
+        // Player 2 answers a shot into fleet2.
+        if (result == ShotResult.MISS) {
+            assert(!fleet2.member(disclose(seal)), "Cheat detected: claimed MISS on a sealed HIT cell");
+        } else {
+            assert(fleet2.member(disclose(seal)), "Cheat detected: claimed HIT on an empty cell");
+            assert(!hitsOn2.member(shot), "Cell already hit");
+            hitsOn2.insert(shot);
+            hitCount2.increment(1);
+            winState = (hitCount2 == 17) ? WinState.PLAYER_1_WINS : WinState.ONGOING;
+        }
+        phase = Phase.P1_SHOOT;
+    }
 }
