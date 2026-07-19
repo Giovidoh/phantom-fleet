@@ -1,60 +1,138 @@
-import { useEffect, useRef } from "react";
-import type { LogEntry } from "../game/types";
+// ProofLog — the ship's cryptographic combat console. The star of the demo.
+// Adapter: entries are supplied newest-first by App; a pending entry shows the
+// fast sonar sweep + scrambling hash while the prover works, and a scan bar
+// sweeps the whole panel whenever any entry is pending.
+import { useEffect, useState } from "react";
 
-// The star of the demo: every shot, its hit/miss answer, and the fact that a
-// real Groth16 proof was generated and verified for it — with timings.
-export default function ProofLog({ entries }: { entries: LogEntry[] }) {
-  const ref = useRef<HTMLDivElement>(null);
+export interface ProofEntry {
+  id: number;
+  actor: "YOU" | "ENMY";
+  coordinate: string;
+  result: "hit" | "miss" | null;
+  pending: boolean;
+  hash?: string; // truncated proof fingerprint, 0x9f3c…a41b
+  ms?: number; // proving time
+  sunk?: string | null; // ship name when this shot sank it
+  note?: string; // error/system line (rare path)
+}
 
+interface ProofLogProps {
+  entries: ProofEntry[]; // newest first
+  session: { commitment?: string; circuit?: string; turnsProven: number };
+}
+
+// Cryptography-working-in-real-time: hash chars scramble every 90 ms.
+function ScrambleHash() {
+  const [txt, setTxt] = useState("0x…………");
   useEffect(() => {
-    const el = ref.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [entries.length]);
+    const chars = "0123456789abcdef";
+    const t = window.setInterval(() => {
+      let s = "0x";
+      for (let i = 0; i < 8; i++) s += chars[Math.floor(Math.random() * 16)];
+      setTxt(`${s}…`);
+    }, 90);
+    return () => window.clearInterval(t);
+  }, []);
+  return <span className="font-mono text-[10.5px] text-phos-300">{txt}</span>;
+}
+
+export default function ProofLog({ entries, session }: ProofLogProps) {
+  const proving = entries.some((e) => e.pending);
 
   return (
-    <div className="flex min-h-0 flex-col rounded-xl border border-cyan-900/40 bg-[#0b1526]/80 p-3">
-      <h2 className="mb-2 text-sm font-semibold tracking-wide text-cyan-200">
-        ZK Proof Log <span className="ml-1 text-[10px] font-normal text-slate-400">every answer is proven, not claimed</span>
-      </h2>
-      <div ref={ref} className="log-scroll min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-1 font-mono text-[11px]">
-        {entries.length === 0 && (
-          <div className="text-slate-500">No shots yet. Fire at the enemy waters to generate the first proof…</div>
-        )}
-        {entries.map((e) => (
-          <div key={e.id} className="rounded border border-slate-800/80 bg-[#081120] px-2 py-1.5">
-            {e.who === "system" ? (
-              <div className="text-slate-400 italic">{e.text}</div>
-            ) : (
-              <>
-                <div className="flex flex-wrap items-center gap-x-2">
-                  <span className="text-slate-500">#{e.n}</span>
-                  <span>{e.who === "fire" ? "🎯" : "🛡️"}</span>
-                  <span className="text-slate-200">{e.text}</span>
-                  {e.result && (
+    <aside
+      data-od-id="proof-log"
+      className="flex min-h-0 min-w-[400px] flex-1 flex-col rounded-panel border border-phos-900/50 bg-abyss-800/70 shadow-panel backdrop-blur"
+    >
+      <header className="flex items-center justify-between border-b border-phos-900/50 px-4 py-3">
+        <div>
+          <h3 className="font-hud text-base font-semibold tracking-hud text-ink-100">ZK COMBAT CONSOLE</h3>
+          <p className="font-mono text-eyebrow text-phos-600">// PROOF LOG — TURN-BY-TURN CRYPTOGRAPHY</p>
+        </div>
+        <span className="flex items-center gap-2 font-mono text-[10.5px] tracking-hud text-alarm-400">
+          <i className="h-1.5 w-1.5 rounded-full bg-alarm-500 shadow-glow-alarm" /> REC
+        </span>
+      </header>
+
+      <div className="relative min-h-0 flex-1">
+        <div className="pf-scroll h-full max-h-[62vh] space-y-2.5 overflow-y-auto px-4 py-3">
+          {entries.length === 0 && (
+            <div className="rounded-hud border border-phos-900/40 bg-abyss-700/50 px-3 py-2 font-mono text-[11px] text-steel-400">
+              NO SHOTS FIRED. FIRST CONTACT GENERATES THE FIRST GROTH16 PROOF…
+            </div>
+          )}
+          {entries.map((e, i) => (
+            <article
+              key={e.id}
+              data-od-id={`log-entry-${e.id}`}
+              className={`animate-log-in rounded-hud px-3 py-2 ${
+                e.pending
+                  ? "relative overflow-hidden border border-dashed border-phos-400/60 bg-abyss-700/70"
+                  : "border border-phos-900/40 bg-abyss-700/50"
+              }`}
+              style={{ animationDelay: `${Math.min(i, 6) * 70}ms` }}
+            >
+              {e.pending && (
+                <div className="absolute inset-0 overflow-hidden">
+                  <div className="absolute inset-[-50%] bg-sweep opacity-40 animate-sweep-fast" />
+                </div>
+              )}
+              <div className="relative flex items-center gap-3">
+                <span className="font-mono text-[11px] text-steel-400">#{String(e.id).padStart(3, "0")}</span>
+                <span className="font-mono text-coord text-ink-100">
+                  {e.actor} · {e.coordinate}
+                </span>
+                {e.sunk && (
+                  <span className="font-mono text-[9.5px] tracking-hud text-alarm-400">▼ {e.sunk} SUNK</span>
+                )}
+                {e.pending ? (
+                  <span className="ml-auto animate-blink font-mono text-[11px] tracking-hud text-phos-300">
+                    PROVING…
+                  </span>
+                ) : (
+                  e.result && (
                     <span
-                      className={`rounded px-1.5 py-px text-[10px] font-bold ${
-                        e.result === "hit" ? "bg-red-500/20 text-red-300" : "bg-sky-500/20 text-sky-300"
+                      className={`pf-stamp ml-auto font-mono ${
+                        e.result === "hit" ? "pf-stamp-hit" : "pf-stamp-miss"
                       }`}
                     >
-                      {e.result.toUpperCase()}
+                      {e.result === "hit" ? "HIT" : "MISS"}
                     </span>
-                  )}
-                </div>
-                {e.verified && (
-                  <div className="mt-0.5 text-[10px] text-emerald-300">
-                    ZK proof verified ✓
-                    <span className="text-slate-500">
-                      {"  ·  prove "}
-                      {e.proveMs} ms · verify {e.verifyMs} ms
-                    </span>
-                  </div>
+                  )
                 )}
-                {e.verified === false && <div className="mt-0.5 text-[10px] text-red-400">proof failed ✗</div>}
-              </>
-            )}
-          </div>
-        ))}
+              </div>
+              <div className="relative mt-1.5 flex items-center gap-3">
+                {e.pending ? (
+                  <>
+                    <span className="font-mono text-[10.5px] text-phos-200">GENERATING ZK PROOF</span>
+                    <ScrambleHash />
+                  </>
+                ) : e.note ? (
+                  <span className="font-mono text-[10.5px] text-alarm-400">{e.note}</span>
+                ) : (
+                  <>
+                    <span className="pf-badge-verify font-mono">PROOF VERIFIED ✓</span>
+                    <span className="font-mono text-[10.5px] text-steel-400">{e.hash}</span>
+                    <span className="ml-auto font-mono text-[10.5px] text-phos-300">{e.ms}ms</span>
+                  </>
+                )}
+              </div>
+            </article>
+          ))}
+        </div>
+        {proving && <div className="pf-scan-line animate-scan-bar" />}
       </div>
-    </div>
+
+      <footer className="border-t border-phos-900/50 px-4 py-2.5 font-mono text-[10.5px] leading-relaxed text-steel-400">
+        SESSION COMMITMENT <span className="text-phos-300">{session.commitment ?? "—"}</span>
+        {session.circuit && (
+          <>
+            {" "}
+            · CIRCUIT <span className="text-ink-300">{session.circuit}</span>
+          </>
+        )}{" "}
+        · {session.turnsProven} TURNS PROVEN
+      </footer>
+    </aside>
   );
 }
