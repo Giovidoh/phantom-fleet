@@ -26,6 +26,7 @@
     "@midnight-ntwrk/midnight-js-utils": "4.1.1",
     "@midnight-ntwrk/testkit-js": "4.1.1",
     "@midnightntwrk/wallet-sdk": "1.2.0",
+    "@vercel/analytics": "^2.0.1",
     "circomlibjs": "^0.1.7",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
